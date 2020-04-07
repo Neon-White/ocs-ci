@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
+from os import getcwd
 
 import boto3
 
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.resources.pod import get_rgw_pod
+from ocs_ci.ocs.utils import get_pod_name_by_pattern
+from ocs_ci.utility.utils import run_cmd
 from tests.helpers import logger, craft_s3_command, craft_s3_api_command
 
 
@@ -34,6 +37,15 @@ def retrieve_test_objects_to_pod(podobj, target_dir):
                      )
             downloaded_objects.append(obj.key)
         return downloaded_objects
+
+
+def retrieve_mcg_cli_to_runner():
+    """
+    Retrieves the MCG CLI from the NooBaa operator pod over to the local test runner
+
+    """
+    nb_operator_pod_name = get_pod_name_by_pattern('noobaa-operator', namespace='openshift-storage')[0]
+    run_cmd(f'oc cp {nb_operator_pod_name}:/usr/local/bin/noobaa-operator {getcwd()}/bin/noobaa')
 
 
 def sync_object_directory(podobj, src, target, mcg_obj=None):
