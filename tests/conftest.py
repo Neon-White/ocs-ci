@@ -65,6 +65,7 @@ from ocs_ci.ocs.utils import (
     setup_ceph_toolbox,
     collect_ocs_logs,
     collect_pod_container_rpm_package,
+    get_dr_operator_versions,
 )
 from ocs_ci.ocs.resources.deployment import Deployment
 from ocs_ci.ocs.resources.job import get_job_obj
@@ -173,6 +174,7 @@ from ocs_ci.helpers.longevity_helpers import (
 )
 from ocs_ci.ocs.longevity import start_app_workload
 from ocs_ci.utility.decorators import switch_to_default_cluster_index_at_last
+
 
 log = logging.getLogger(__name__)
 
@@ -1594,6 +1596,9 @@ def additional_testsuite_properties(record_testsuite_property, pytestconfig):
     # add markers as separated property
     markers = ocsci_config.RUN["cli_params"].get("-m", "").replace(" ", "-")
     record_testsuite_property("rp_markers", markers)
+    dr_operator_versions = get_dr_operator_versions()
+    for dr_operator_name, dr_operator_version in dr_operator_versions.items():
+        record_testsuite_property(f"rp_{dr_operator_name}", dr_operator_version)
 
 
 @pytest.fixture(scope="session")
@@ -4688,7 +4693,7 @@ def login_factory_fixture(request):
     drivers = []
 
     def factory(username, password):
-        driver = login_ui(username=username, password=password, request=request)
+        driver = login_ui(username=username, password=password)
         drivers.append(driver)
         return driver
 
@@ -4919,13 +4924,26 @@ def setup_ui_class(request):
     return setup_ui_fixture(request)
 
 
+@pytest.fixture(scope="class")
+def setup_ui_class_factory(request):
+    # The problem with class scope fixtures is that they are executed always the first, when the class is loaded.
+    # This fixture is used to control fixture execution order, and call the fixture from within the test, after
+    # switch_to_provider fixture with autouse=True will be executed (for example).
+    # This way we can control the order of execution and perform login to management-console only after
+    # switching the context.
+    def factory():
+        setup_ui_fixture(request)
+
+    return factory
+
+
 @pytest.fixture(scope="function")
 def setup_ui(request):
     return setup_ui_fixture(request)
 
 
 def setup_ui_fixture(request):
-    driver = login_ui(request=request)
+    driver = login_ui()
 
     def finalizer():
         close_browser()
@@ -6565,7 +6583,7 @@ def dr_workload(request):
     def factory(
         num_of_subscription=1,
         num_of_appset=0,
-        appset_model="pull",
+        appset_model=None,
         pvc_interface=constants.CEPHBLOCKPOOL,
         switch_ctx=None,
     ):
@@ -6573,11 +6591,11 @@ def dr_workload(request):
         Args:
             num_of_subscription (int): Number of Subscription type workload to be created
             num_of_appset (int): Number of ApplicationSet type workload to be created
+            appset_model (str): GitOps ApplicationSet deployment model. Valid values include "pull" or "push".
+                ODF 4.16 onwards, "pull" model is the default if not user-provided.
             pvc_interface (str): 'CephBlockPool' or 'CephFileSystem'.
                 This decides whether a RBD based or CephFS based resource is created. RBD is default.
             switch_ctx (int): The cluster index by the cluster name
-            appset_model (str): Appset Gitops deployment now supports "pull" model starting ACM 2.10 which is now the
-                default selection in addition to "push" model.
 
         Raises:
             ResourceNotDeleted: In case workload resources not deleted properly
@@ -6588,11 +6606,20 @@ def dr_workload(request):
         """
         ctx.append(switch_ctx)
         total_pvc_count = 0
-        workload_key = "dr_workload_subscription"
-        if pvc_interface == constants.CEPHFILESYSTEM:
-            workload_key = "dr_workload_subscription_cephfs"
+
+        if pvc_interface == constants.CEPHBLOCKPOOL:
+            interface = constants.RBD_INTERFACE
+        else:
+            interface = constants.CEPHFS_INTERFACE
+
+        if num_of_appset > 0 and appset_model is None:
+            ocs_version = version.get_semantic_ocs_version_from_config()
+            appset_model = "pull" if ocs_version >= version.VERSION_4_16 else "push"
 
         for index in range(num_of_subscription):
+            workload_key = "dr_workload_subscription"
+            if ocsci_config.MULTICLUSTER["multicluster_mode"] == constants.RDR_MODE:
+                workload_key += f"_{interface}"
             workload_details = ocsci_config.ENV_DATA[workload_key][index]
             workload = BusyBox(
                 workload_dir=workload_details["workload_dir"],
@@ -6604,7 +6631,10 @@ def dr_workload(request):
             workload.deploy_workload()
 
         for index in range(num_of_appset):
-            workload_details = ocsci_config.ENV_DATA["dr_workload_appset"][index]
+            workload_key = "dr_workload_appset"
+            if ocsci_config.MULTICLUSTER["multicluster_mode"] == constants.RDR_MODE:
+                workload_key += f"_{interface}"
+            workload_details = ocsci_config.ENV_DATA[workload_key][index]
             workload = BusyBox_AppSet(
                 workload_dir=workload_details["workload_dir"],
                 workload_pod_count=workload_details["pod_count"],
@@ -6618,11 +6648,11 @@ def dr_workload(request):
             instances.append(workload)
             total_pvc_count += workload_details["pvc_count"]
             workload.deploy_workload()
-        if ocsci_config.MULTICLUSTER["multicluster_mode"] == constants.RDR_MODE:
-            if pvc_interface != constants.CEPHFILESYSTEM:
-                dr_helpers.wait_for_mirroring_status_ok(
-                    replaying_images=total_pvc_count
-                )
+        if (
+            ocsci_config.MULTICLUSTER["multicluster_mode"] == constants.RDR_MODE
+            and pvc_interface == constants.CEPHBLOCKPOOL
+        ):
+            dr_helpers.wait_for_mirroring_status_ok(replaying_images=total_pvc_count)
         return instances
 
     def teardown():
@@ -6691,7 +6721,6 @@ def cnv_dr_workload(request):
                     vm_secret=workload_details["vm_secret"],
                     vm_username=workload_details["vm_username"],
                     workload_name=workload_details["name"],
-                    workload_namespace=workload_details["destination_namespace"],
                     workload_pod_count=workload_details["pod_count"],
                     workload_pvc_count=workload_details["pvc_count"],
                     workload_placement_name=workload_details[
@@ -6700,9 +6729,11 @@ def cnv_dr_workload(request):
                     workload_pvc_selector=workload_details[
                         "dr_workload_app_pvc_selector"
                     ],
-                    appset_model=workload_details["appset_model"]
-                    if workload_type == constants.APPLICATION_SET
-                    else None,
+                    appset_model=(
+                        workload_details["appset_model"]
+                        if workload_type == constants.APPLICATION_SET
+                        else None
+                    ),
                 )
                 instances.append(workload)
                 total_pvc_count += workload_details["pvc_count"]
@@ -7066,6 +7097,15 @@ def add_env_vars_to_noobaa_core_fixture(request, mcg_obj_session):
 
 @pytest.fixture()
 def logwriter_cephfs_many_pvc_factory(request, pvc_factory):
+    return logwriter_cephfs_many_pvc(request, pvc_factory)
+
+
+@pytest.fixture(scope="class")
+def logwriter_cephfs_many_pvc_class(request, pvc_factory_class):
+    return logwriter_cephfs_many_pvc(request, pvc_factory_class)
+
+
+def logwriter_cephfs_many_pvc(request, pvc_factory):
     """
     Fixture to create RWX cephfs volume
 
@@ -7091,8 +7131,17 @@ def setup_stretch_cluster_project(request, project_factory_session):
     return project_factory_session(constants.STRETCH_CLUSTER_NAMESPACE)
 
 
+@pytest.fixture(scope="class")
+def logwriter_workload_class(request, teardown_factory_class):
+    return setup_logwriter_workload(request, teardown_factory_class)
+
+
 @pytest.fixture()
 def logwriter_workload_factory(request, teardown_factory):
+    return setup_logwriter_workload(request, teardown_factory)
+
+
+def setup_logwriter_workload(request, teardown_factory):
     """
     Fixture to create logwriter deployment
 
@@ -7140,8 +7189,17 @@ def logwriter_workload_factory(request, teardown_factory):
     return factory
 
 
+@pytest.fixture(scope="class")
+def logreader_workload_class(request, teardown_factory_class):
+    return setup_logreader_workload(request, teardown_factory_class)
+
+
 @pytest.fixture()
 def logreader_workload_factory(request, teardown_factory):
+    return setup_logreader_workload(request, teardown_factory)
+
+
+def setup_logreader_workload(request, teardown_factory):
     def factory(pvc, logreader_path, duration=30):
         """
         Args:
@@ -7188,8 +7246,47 @@ def logreader_workload_factory(request, teardown_factory):
     return factory
 
 
+@pytest.fixture(scope="class")
+def setup_logwriter_cephfs_workload_class(
+    request,
+    setup_stretch_cluster_project,
+    pvc_factory_class,
+    logwriter_cephfs_many_pvc_class,
+    logwriter_workload_class,
+    logreader_workload_class,
+):
+
+    return setup_logwriter_cephfs_workload(
+        request,
+        setup_stretch_cluster_project,
+        pvc_factory_class,
+        logwriter_cephfs_many_pvc_class,
+        logwriter_workload_class,
+        logreader_workload_class,
+    )
+
+
 @pytest.fixture()
 def setup_logwriter_cephfs_workload_factory(
+    request,
+    setup_stretch_cluster_project,
+    pvc_factory,
+    logwriter_cephfs_many_pvc_factory,
+    logwriter_workload_factory,
+    logreader_workload_factory,
+):
+
+    return setup_logwriter_cephfs_workload(
+        request,
+        setup_stretch_cluster_project,
+        pvc_factory,
+        logwriter_cephfs_many_pvc_factory,
+        logwriter_workload_factory,
+        logreader_workload_factory,
+    )
+
+
+def setup_logwriter_cephfs_workload(
     request,
     setup_stretch_cluster_project,
     pvc_factory,
@@ -7228,8 +7325,25 @@ def setup_logwriter_cephfs_workload_factory(
     return factory
 
 
+@pytest.fixture(scope="class")
+def setup_logwriter_rbd_workload_class(
+    request, setup_stretch_cluster_project, teardown_factory_class
+):
+    return setup_logwriter_rbd_workload(
+        request, setup_stretch_cluster_project, teardown_factory_class
+    )
+
+
 @pytest.fixture()
 def setup_logwriter_rbd_workload_factory(
+    request, setup_stretch_cluster_project, teardown_factory
+):
+    return setup_logwriter_rbd_workload(
+        request, setup_stretch_cluster_project, teardown_factory
+    )
+
+
+def setup_logwriter_rbd_workload(
     request, setup_stretch_cluster_project, teardown_factory
 ):
     """
